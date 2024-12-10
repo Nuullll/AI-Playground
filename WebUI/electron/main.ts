@@ -19,6 +19,7 @@ import koffi from 'koffi';
 import sudo from "sudo-prompt";
 import { PathsManager } from "./pathsManager";
 import getPort, { portNumbers } from "get-port";
+import { getDeviceArch } from "./deviceArch";
 
 // }
 // The built directory structure
@@ -798,6 +799,102 @@ function isAdmin(): boolean {
   }
 }
 
+function getPythonEnvDir() {
+  return path.resolve(path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, "../../../"), "env"));
+}
+
+function getPythonExe() {
+  return path.resolve(path.join(getPythonEnvDir(), "python.exe"));
+}
+
+async function pip(args: string[]) {
+  const pythonExe = getPythonExe();
+  logger.info(`Running pip ${args.join(" ")}`);
+  const cmd = spawn(pythonExe, ["-m", "pip", ...args]);
+  cmd.stdout.on("data", (data) => {
+    console.log(`${data}`);
+  });
+  cmd.stderr.on("data", (data) => {
+    console.error(`${data}`);
+  });
+
+  return new Promise<void>((resolve, reject) => {
+    cmd.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`pip exited with code ${code}`));
+      }
+    });
+  });
+}
+
+async function getLevelZeroDevices() {
+  const envDir = getPythonEnvDir();
+  const serviceDir = path.resolve(path.join(envDir, "../service"));
+  const lsLevelZero = path.resolve(path.join(envDir, "Library/bin/ls_level_zero.exe"));
+  if (!fs.existsSync(lsLevelZero)) {
+    // copy ls_level_zero.exe from service/tools to env/Library/bin for SYCL environment
+    const src = path.resolve(path.join(serviceDir, "tools/ls_level_zero.exe"));
+    fs.copyFileSync(src, lsLevelZero);
+  }
+
+  // Install oneAPI requirements (dependency of ls_level_zero.exe)
+  const oneAPIRequirements = path.resolve(path.join(serviceDir, "requirements-oneapi.txt"));
+  await pip(["install", "-r", oneAPIRequirements]).catch((error) => {
+    logger.error(`Failed to install oneAPI requirements: ${error}`);
+    return;
+  });
+
+  const ls = spawnSync(lsLevelZero);
+  if (ls.status !== 0) {
+    logger.error(`ls_level_zero.exe exited with code ${ls.status}`);
+    return [];
+  }
+
+  return JSON.parse(ls.stdout.toString());
+}
+
+// FIXME: GUI should show python env setup progress/log
+// FIXME: error handling / retry
+async function preparePythonEnv() {
+  try {
+    // TODO: Check exisitence of .env.ok file to avoid repeated setup
+    const pythonExe = getPythonExe();
+    const envDir = getPythonEnvDir();
+    const serviceDir = path.resolve(path.join(envDir, "../service"));
+    if (!fs.existsSync(pythonExe)) {
+      logger.error(`Python executable not found: ${pythonExe}`);
+      return;
+    }
+
+    const devices = await getLevelZeroDevices();
+    logger.info(`Level Zero devices: ${JSON.stringify(devices)}`);
+    let detectedArch = "unknown";
+    for (const device of devices) {            // FIXME: GUI should allow user to select device at this first boot-up time
+      detectedArch = getDeviceArch(device.device_id);
+      if (detectedArch !== "unknown") {
+        break;
+      }
+    }
+    if (detectedArch === "unknown") {
+      logger.error("Failed to detect architecture");
+      return;
+    }
+    logger.info(`Detected architecture: ${detectedArch}`);
+
+    // Install IPEX
+    const ipexRequirements = path.resolve(path.join(serviceDir, `requirements-${detectedArch}.txt`));
+    await pip(["install", "-r", ipexRequirements]);
+
+    // Install common requirements
+    const commonRequirements = path.resolve(path.join(serviceDir, "requirements.txt"));
+    await pip(["install", "-r", commonRequirements]);
+  } catch (error) {
+    logger.error(`Failed to setup Python environment: ${error}`);
+  }
+}
+
 app.whenReady().then(async () => {
   /*
   The current user does not have write permission for files in the program directory and is not an administrator. 
@@ -829,6 +926,7 @@ app.whenReady().then(async () => {
     await loadSettings();
     initEventHandle();
     createWindow();
+    await preparePythonEnv();
     wakeupApiService();
   }
 });
